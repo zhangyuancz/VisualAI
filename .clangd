@@ -1,0 +1,10 @@
+CompileFlags:
+  # Explicitly add aarch64 cross-compiler system include paths.
+  # These are the paths reported by: aarch64-linux-gnu-g++ -E -x c++ - -v
+  # clangd does not query the cross-compiler automatically; we must add them here.
+  Add:
+    - -isystem/usr/aarch64-linux-gnu/include/c++/13
+    - -isystem/usr/aarch64-linux-gnu/include/c++/13/aarch64-linux-gnu
+    - -isystem/usr/aarch64-linux-gnu/include/c++/13/backward
+    - -isystem/usr/lib/gcc-cross/aarch64-linux-gnu/13/include
+    - -isystem/usr/aarch64-linux-gnu/include
