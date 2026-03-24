@@ -21,8 +21,11 @@ extern "C" {
 
 struct DecoderConfig {
     std::string url;
-    std::string rtsp_transport = "tcp";   /* "tcp" | "udp" */
-    int         num_hw_frames  = 16;      /* RKMPP frame pool size */
+    std::string rtsp_transport     = "tcp";  /* "tcp" | "udp" */
+    int         num_hw_frames      = 16;     /* RKMPP frame pool size */
+    int         reconnect_retries  = -1;     /* -1 = unlimited; 0 = disabled */
+    int         reconnect_delay_ms = 1000;   /* base backoff; doubles each attempt (max 30 s) */
+    int         read_timeout_s     = 10;     /* abort read if no packet for N seconds; 0 = off */
 };
 
 struct VideoInfo {
@@ -39,7 +42,7 @@ public:
     explicit Decoder(BoundedQueue<AVFrame *> &out_queue);
     ~Decoder();
 
-    /* Initialise codec; fills info. Returns false on error. */
+    /* Initialise hw device and open stream; fills info. Returns false on error. */
     bool init(const DecoderConfig &cfg, VideoInfo &info);
 
     /* Start decode thread. */
@@ -54,13 +57,15 @@ public:
 private:
     void run();
 
+    /* (Re)open / close the format + codec context. hw_dev_ is reused. */
+    bool open_stream(VideoInfo &info);
+    void close_stream();
+
     static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
                                             const enum AVPixelFormat *pix_fmts);
 
-    /* FFmpeg interrupt callback — returns 1 to abort blocking calls when stopping */
-    static int interrupt_cb(void *opaque) {
-        return static_cast<Decoder *>(opaque)->stop_req_.load() ? 1 : 0;
-    }
+    /* FFmpeg interrupt callback — returns 1 when stopping or read has stalled */
+    static int interrupt_cb(void *opaque);
 
     BoundedQueue<AVFrame *> &out_queue_;
 
@@ -69,6 +74,9 @@ private:
     AVBufferRef     *hw_dev_   = nullptr;
     int              vid_idx_  = -1;
     int64_t          frame_id_ = 0;
+
+    DecoderConfig        cfg_;
+    std::atomic<int64_t> last_pkt_us_{0};  /* monotonic µs of last received packet */
 
     std::thread      thread_;
     std::atomic<bool>    running_{false};

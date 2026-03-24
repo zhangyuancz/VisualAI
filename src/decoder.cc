@@ -6,6 +6,7 @@
  */
 #include "decoder.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 extern "C" {
@@ -34,9 +35,8 @@ Decoder::Decoder(BoundedQueue<AVFrame *> &out_queue) : out_queue_(out_queue) {}
 
 Decoder::~Decoder() {
     stop();
+    close_stream();
     av_buffer_unref(&hw_dev_);
-    avcodec_free_context(&dec_ctx_);
-    avformat_close_input(&fmt_ctx_);
 }
 
 /* ── get_format callback: prefer DRM_PRIME for zero-copy ───────────────────── */
@@ -50,31 +50,60 @@ enum AVPixelFormat Decoder::get_hw_format(AVCodecContext * /*ctx*/,
     return pix_fmts[0];
 }
 
-/* ── init ──────────────────────────────────────────────────────────────────── */
-bool Decoder::init(const DecoderConfig &cfg, VideoInfo &info)
+/* ── interrupt callback: abort blocking FFmpeg calls on stop or read stall ──── */
+int Decoder::interrupt_cb(void *opaque)
+{
+    auto *d = static_cast<Decoder *>(opaque);
+    if (d->stop_req_.load()) return 1;
+    if (d->cfg_.read_timeout_s > 0) {
+        int64_t elapsed_us = now_us() - d->last_pkt_us_.load();
+        if (elapsed_us > static_cast<int64_t>(d->cfg_.read_timeout_s) * 1'000'000LL)
+            return 1;
+    }
+    return 0;
+}
+
+/* ── open_stream: (re)open format + codec context ──────────────────────────── */
+bool Decoder::open_stream(VideoInfo &info)
 {
     char errbuf[256];
     int  ret;
 
-    /* Open RTSP input */
+    /* Reset watchdog FIRST so interrupt_cb doesn't fire during open/probe */
+    last_pkt_us_.store(now_us());
+
+    fprintf(stderr, "[Decoder] Opening stream: %s\n", cfg_.url.c_str());
+
+    /* Pre-allocate context so interrupt_cb can be attached before avformat_open_input,
+     * enabling stop_req_ to abort a blocking connect attempt. */
+    fmt_ctx_ = avformat_alloc_context();
+    fmt_ctx_->interrupt_callback.callback = Decoder::interrupt_cb;
+    fmt_ctx_->interrupt_callback.opaque   = this;
+
     AVDictionary *opts = nullptr;
-    av_dict_set(&opts, "rtsp_transport",  cfg.rtsp_transport.c_str(), 0);
+    av_dict_set(&opts, "rtsp_transport",  cfg_.rtsp_transport.c_str(), 0);
     av_dict_set(&opts, "stimeout",        "5000000",  0);
     av_dict_set(&opts, "analyzeduration", "1000000",  0);
     av_dict_set(&opts, "probesize",       "1000000",  0);
     av_dict_set(&opts, "max_delay",       "500000",   0);
 
-    ret = avformat_open_input(&fmt_ctx_, cfg.url.c_str(), nullptr, &opts);
+    ret = avformat_open_input(&fmt_ctx_, cfg_.url.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     if (ret < 0) {
         av_strerror(ret, errbuf, sizeof(errbuf));
-        fprintf(stderr, "[Decoder] avformat_open_input: %s\n", errbuf);
+        fprintf(stderr, "[Decoder] avformat_open_input failed: %s\n", errbuf);
+        fmt_ctx_ = nullptr;  /* avformat_open_input frees ctx on failure */
         return false;
     }
 
+    /* Refresh watchdog after connection is established */
+    last_pkt_us_.store(now_us());
+
     ret = avformat_find_stream_info(fmt_ctx_, nullptr);
     if (ret < 0) {
-        fprintf(stderr, "[Decoder] avformat_find_stream_info failed\n");
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        fprintf(stderr, "[Decoder] avformat_find_stream_info failed: %s\n", errbuf);
+        avformat_close_input(&fmt_ctx_);
         return false;
     }
 
@@ -82,6 +111,7 @@ bool Decoder::init(const DecoderConfig &cfg, VideoInfo &info)
     int audio_idx = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (video_idx < 0) {
         fprintf(stderr, "[Decoder] No video stream found\n");
+        avformat_close_input(&fmt_ctx_);
         return false;
     }
     vid_idx_ = video_idx;
@@ -89,7 +119,6 @@ bool Decoder::init(const DecoderConfig &cfg, VideoInfo &info)
     AVStream *vs  = fmt_ctx_->streams[video_idx];
     auto     *vcp = vs->codecpar;
 
-    /* Populate VideoInfo */
     info.width            = vcp->width;
     info.height           = vcp->height;
     info.bitrate          = vcp->bit_rate;
@@ -112,21 +141,17 @@ bool Decoder::init(const DecoderConfig &cfg, VideoInfo &info)
         decoder = avcodec_find_decoder(vcp->codec_id);
         if (!decoder) {
             fprintf(stderr, "[Decoder] No decoder for %s\n", info.codec_name.c_str());
+            avformat_close_input(&fmt_ctx_);
             return false;
         }
     }
 
-    /* Create RKMPP HW device context */
-    ret = av_hwdevice_ctx_create(&hw_dev_, AV_HWDEVICE_TYPE_RKMPP, nullptr, nullptr, 0);
-    if (ret < 0) {
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        fprintf(stderr, "[Decoder] av_hwdevice_ctx_create: %s\n", errbuf);
-        hw_dev_ = nullptr;  /* will fall back to SW */
-    }
-
-    /* Allocate and configure codec context */
     dec_ctx_ = avcodec_alloc_context3(decoder);
-    if (!dec_ctx_) { fprintf(stderr, "[Decoder] alloc context failed\n"); return false; }
+    if (!dec_ctx_) {
+        fprintf(stderr, "[Decoder] alloc context failed\n");
+        avformat_close_input(&fmt_ctx_);
+        return false;
+    }
 
     avcodec_parameters_to_context(dec_ctx_, vcp);
     dec_ctx_->time_base = vs->time_base;
@@ -134,17 +159,11 @@ bool Decoder::init(const DecoderConfig &cfg, VideoInfo &info)
     if (hw_dev_) {
         dec_ctx_->hw_device_ctx  = av_buffer_ref(hw_dev_);
         dec_ctx_->get_format     = get_hw_format;
-        /* Pre-allocate extra DRM frames for the pipeline queue */
-        dec_ctx_->extra_hw_frames = cfg.num_hw_frames;
+        dec_ctx_->extra_hw_frames = cfg_.num_hw_frames;
     }
 
     dec_ctx_->flags  |= AV_CODEC_FLAG_LOW_DELAY;
     dec_ctx_->flags2 |= AV_CODEC_FLAG2_FAST;
-
-    /* Interrupt callback: makes av_read_frame() return AVERROR_EXIT immediately
-     * when stop_req_ is set, instead of blocking on the network. */
-    fmt_ctx_->interrupt_callback.callback = Decoder::interrupt_cb;
-    fmt_ctx_->interrupt_callback.opaque   = this;
 
     AVDictionary *codec_opts = nullptr;
     if (hw_dev_) av_dict_set(&codec_opts, "fast_mode", "1", 0);
@@ -154,12 +173,40 @@ bool Decoder::init(const DecoderConfig &cfg, VideoInfo &info)
     if (ret < 0) {
         av_strerror(ret, errbuf, sizeof(errbuf));
         fprintf(stderr, "[Decoder] avcodec_open2: %s\n", errbuf);
+        avcodec_free_context(&dec_ctx_);
+        avformat_close_input(&fmt_ctx_);
         return false;
     }
 
-    fprintf(stderr, "[Decoder] Using decoder: %s  hw=%s  extra_frames=%d\n",
-            decoder->name, hw_dev_ ? "RKMPP" : "SW", dec_ctx_->extra_hw_frames);
+    last_pkt_us_.store(now_us());
+    fprintf(stderr, "[Decoder] Stream ready: %dx%d  %.2f fps  codec=%s  hw=%s\n",
+            info.width, info.height, info.fps, decoder->name,
+            hw_dev_ ? "RKMPP" : "SW");
     return true;
+}
+
+/* ── close_stream: release format + codec context ──────────────────────────── */
+void Decoder::close_stream()
+{
+    avcodec_free_context(&dec_ctx_);
+    avformat_close_input(&fmt_ctx_);
+}
+
+/* ── init ──────────────────────────────────────────────────────────────────── */
+bool Decoder::init(const DecoderConfig &cfg, VideoInfo &info)
+{
+    cfg_ = cfg;
+
+    /* Create RKMPP HW device context once; reused across reconnects */
+    char errbuf[256];
+    int  ret = av_hwdevice_ctx_create(&hw_dev_, AV_HWDEVICE_TYPE_RKMPP, nullptr, nullptr, 0);
+    if (ret < 0) {
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        fprintf(stderr, "[Decoder] av_hwdevice_ctx_create: %s\n", errbuf);
+        hw_dev_ = nullptr;
+    }
+
+    return open_stream(info);
 }
 
 /* ── start / stop ──────────────────────────────────────────────────────────── */
@@ -181,51 +228,128 @@ void Decoder::run()
     AVPacket *pkt   = av_packet_alloc();
     AVFrame  *frame = av_frame_alloc();
 
-    bool queue_closed = false;
-    while (!stop_req_.load() && !queue_closed) {
-        int ret = av_read_frame(fmt_ctx_, pkt);
-        if (ret == AVERROR(EAGAIN)) { av_usleep(500); continue; }
-        if (ret < 0) {
-            if (ret != AVERROR_EOF && ret != AVERROR_EXIT) {
+    int retries  = 0;
+    int max_ret  = cfg_.reconnect_retries;   /* -1 = unlimited */
+
+    fprintf(stderr, "[Decoder] Decode thread started (reconnect=%s max=%d timeout=%ds)\n",
+            max_ret != 0 ? "on" : "off", max_ret, cfg_.read_timeout_s);
+
+    /* Outer loop: reconnect on network errors */
+    while (!stop_req_.load()) {
+        bool need_reconnect = false;
+        bool queue_closed   = false;
+
+        /* ── Inner read/decode loop ── */
+        while (!stop_req_.load() && !queue_closed) {
+            /* fmt_ctx_ can be null when a previous open_stream() attempt failed */
+            if (!fmt_ctx_) { need_reconnect = true; break; }
+
+            int ret = av_read_frame(fmt_ctx_, pkt);
+
+            if (ret == AVERROR(EAGAIN)) { av_usleep(1000); continue; }
+
+            if (ret == AVERROR_EXIT) {
+                /* Triggered by interrupt_cb: either explicit stop or read stall */
+                if (!stop_req_.load()) {
+                    fprintf(stderr, "[Decoder] Read stall: no packet for %d s; will reconnect\n",
+                            cfg_.read_timeout_s);
+                    need_reconnect = true;
+                }
+                break;
+            }
+
+            if (ret == AVERROR_EOF) {
+                /* Stream ended (sender stopped pushing). Treat as reconnectable. */
+                fprintf(stderr, "[Decoder] Stream EOF (sender disconnected); will reconnect\n");
+                need_reconnect = true;
+                break;
+            }
+
+            if (ret < 0) {
                 char errbuf[256];
                 av_strerror(ret, errbuf, sizeof(errbuf));
-                fprintf(stderr, "[Decoder] read error: %s\n", errbuf);
+                fprintf(stderr, "[Decoder] Read error: %s; will reconnect\n", errbuf);
+                need_reconnect = true;
+                break;
             }
+
+            last_pkt_us_.store(now_us());  /* reset watchdog on every packet */
+
+            if (pkt->stream_index != vid_idx_) { av_packet_unref(pkt); continue; }
+
+            ret = avcodec_send_packet(dec_ctx_, pkt);
+            av_packet_unref(pkt);
+            if (ret < 0 && ret != AVERROR(EAGAIN)) continue;
+
+            while (!stop_req_.load()) {
+                ret = avcodec_receive_frame(dec_ctx_, frame);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                if (ret < 0) break;
+
+                frame->pts = frame_id_++;
+
+                AVFrame *queued = av_frame_clone(frame);
+                av_frame_unref(frame);
+
+                if (queued) {
+                    bool ok = out_queue_.push_latest(queued, [this](AVFrame *f) {
+                        av_frame_free(&f);
+                        ++dropped_;
+                    });
+                    if (!ok) { queue_closed = true; break; }
+                }
+            }
+        }
+
+        if (stop_req_.load() || queue_closed) break;
+        if (!need_reconnect) break;  /* should not happen but guard anyway */
+
+        /* ── Reconnect with exponential backoff ── */
+        if (max_ret == 0) {
+            fprintf(stderr, "[Decoder] Reconnect disabled; exiting\n");
+            break;
+        }
+        if (max_ret > 0 && retries >= max_ret) {
+            fprintf(stderr, "[Decoder] Max reconnect attempts (%d) reached; exiting\n", max_ret);
             break;
         }
 
-        if (pkt->stream_index != vid_idx_) { av_packet_unref(pkt); continue; }
+        int delay_ms = std::min(cfg_.reconnect_delay_ms * (1 << std::min(retries, 5)), 30000);
+        const char *limit_str = (max_ret < 0) ? "unlimited" : "";
+        int limit_num = (max_ret > 0) ? max_ret : 0;
+        if (max_ret < 0)
+            fprintf(stderr, "[Decoder] Reconnecting in %d ms (attempt %d, %s)...\n",
+                    delay_ms, retries + 1, limit_str);
+        else
+            fprintf(stderr, "[Decoder] Reconnecting in %d ms (attempt %d/%d)...\n",
+                    delay_ms, retries + 1, limit_num);
 
-        ret = avcodec_send_packet(dec_ctx_, pkt);
-        av_packet_unref(pkt);
-        if (ret < 0 && ret != AVERROR(EAGAIN)) continue;
+        /* Interruptible sleep so stop() wakes us quickly */
+        for (int elapsed = 0; elapsed < delay_ms && !stop_req_.load(); elapsed += 50)
+            av_usleep(50 * 1000);
 
-        while (!stop_req_.load()) {
-            ret = avcodec_receive_frame(dec_ctx_, frame);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-            if (ret < 0) break;
+        if (stop_req_.load()) break;
 
-            frame->pts = frame_id_++;
-
-            AVFrame *queued = av_frame_clone(frame);
-            av_frame_unref(frame);
-
-            if (queued) {
-                bool ok = out_queue_.push_latest(queued, [this](AVFrame *f) {
-                    av_frame_free(&f);
-                    ++dropped_;
-                });
-                /* push_latest returns false when queue is closed → exit both loops */
-                if (!ok) { queue_closed = true; break; }
-            }
+        close_stream();
+        VideoInfo dummy{};
+        if (!open_stream(dummy)) {
+            fprintf(stderr, "[Decoder] Reconnect attempt %d failed; will retry\n", retries + 1);
+            ++retries;
+            continue;
         }
+
+        fprintf(stderr, "[Decoder] Reconnected successfully (was attempt %d)\n", retries + 1);
+        retries = 0;
     }
 
-    if (!stop_req_.load()) {
+    /* Flush decoder before exiting */
+    if (!stop_req_.load() && dec_ctx_) {
         avcodec_send_packet(dec_ctx_, nullptr);
         while (avcodec_receive_frame(dec_ctx_, frame) >= 0) av_frame_unref(frame);
     }
 
+    fprintf(stderr, "[Decoder] Decode thread exiting (frames=%lld dropped=%lld)\n",
+            (long long)frame_id_, (long long)dropped_.load());
 
     av_frame_free(&frame);
     av_packet_free(&pkt);
