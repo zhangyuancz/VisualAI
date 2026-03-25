@@ -165,11 +165,15 @@ void NpuWorker::start() {
     running_.store(true);
     stop_req_.store(false);
     thread_ = std::thread(&NpuWorker::run, this);
+    if (mjpeg_server_)
+        web_thread_ = std::thread(&NpuWorker::web_run, this);
 }
 
 void NpuWorker::stop() {
     stop_req_.store(true);
-    if (thread_.joinable()) thread_.join();
+    web_queue_.close();
+    if (web_thread_.joinable()) web_thread_.join();
+    if (thread_.joinable())     thread_.join();
     running_.store(false);
 }
 
@@ -392,6 +396,17 @@ void NpuWorker::encode_and_push_web(const uint8_t *nv12, int w, int h,
     }
     av_packet_free(&pkt);
 }
+
+/* ── web_run: dedicated MJPEG encoder thread ────────────────────────────────── */
+void NpuWorker::web_run()
+{
+    WebTask task;
+    while (web_queue_.pop(task)) {
+        encode_and_push_web(task.nv12.data(), task.w, task.h,
+                            task.y_stride, task.dets);
+    }
+}
+
 void NpuWorker::run()
 {
     AVFrame *frame = nullptr;
@@ -414,23 +429,25 @@ void NpuWorker::run()
         int orig_h = frame->height;
 
         /* ── Capture NV12 for web debug (before freeing the DMA frame) ── */
-        int web_y_stride = 0;
+        WebTask web_task;
+        bool    web_ok = false;
         if (mjpeg_server_ && ok) {
             auto *drm = reinterpret_cast<AVDRMFrameDescriptor *>(frame->data[0]);
             if (drm && drm->nb_objects > 0) {
                 int    dma_fd = drm->objects[0].fd;
                 size_t dma_sz = static_cast<size_t>(drm->objects[0].size);
-                web_y_stride  = (drm->nb_layers > 0 && drm->layers[0].nb_planes > 0)
-                                     ? static_cast<int>(drm->layers[0].planes[0].pitch)
-                                     : orig_w;
-
+                web_task.y_stride = (drm->nb_layers > 0 && drm->layers[0].nb_planes > 0)
+                                        ? static_cast<int>(drm->layers[0].planes[0].pitch)
+                                        : orig_w;
                 void *mapped = mmap(nullptr, dma_sz, PROT_READ, MAP_SHARED, dma_fd, 0);
                 if (mapped != MAP_FAILED) {
-                    web_nv12_buf_.resize(dma_sz);
-                    memcpy(web_nv12_buf_.data(), mapped, dma_sz);
+                    web_task.nv12.resize(dma_sz);
+                    memcpy(web_task.nv12.data(), mapped, dma_sz);
                     munmap(mapped, dma_sz);
-                } else {
-                    web_y_stride = 0;  /* signal: capture failed */
+                    web_task.w   = orig_w;
+                    web_task.h   = orig_h;
+                    web_task.pts = frame->pts;
+                    web_ok = true;
                 }
             }
         }
@@ -465,10 +482,10 @@ void NpuWorker::run()
 
         result.postproc_us = now_us() - t0;
 
-        /* ── Web debug: annotate + JPEG encode ── */
-        if (mjpeg_server_ && web_y_stride > 0 && !web_nv12_buf_.empty()) {
-            encode_and_push_web(web_nv12_buf_.data(), orig_w, orig_h,
-                                web_y_stride, result.dets);
+        /* ── Web debug: hand off to encoder thread (non-blocking) ── */
+        if (mjpeg_server_ && web_ok) {
+            web_task.dets = result.dets;
+            web_queue_.push_latest(std::move(web_task), [](WebTask &) {});
         }
 
         out_queue_.push(std::move(result));

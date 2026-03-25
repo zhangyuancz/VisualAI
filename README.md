@@ -9,7 +9,7 @@ RTSP → RKMPP 硬件解码 → RGA 缩放 → RKNN YOLOv8 推理，面向 RK357
 - **RTSP 拉流**：支持 TCP / UDP，FFmpeg + h264_rkmpp / hevc_rkmpp 硬件解码
 - **零拷贝**：RKMPP DMA buf 直接送入 RGA，RGA 输出直接写入 RKNN 输入 buffer，CPU 不参与像素搬运
 - **实时性**：推理速度低于流帧率时，自动丢弃最旧帧，始终处理最新画面
-- **多 NPU 核心**：`--npu -1` 自动按 SoC 核心数（RK3576=2，RK3588=3）创建对应线程，全部使用 `RKNN_NPU_CORE_AUTO` 由驱动动态调度
+- **多 NPU 核心**：`--npu -1` 自动按 SoC 核心数（RK3576=2，RK3588=3）创建对应线程，每线程 pin 到固定 NPU 核心（`RKNN_NPU_CORE_0/1/2`）
 - **断流自动重连**：EOF / 网络错误 / 读超时均触发重连，指数退避，无需外部守护进程
 - **MJPEG 调试查看器**：可选开启，浏览器实时查看带检测框的标注画面
 
@@ -33,7 +33,8 @@ RTSP → RKMPP 硬件解码 → RGA 缩放 → RKNN YOLOv8 推理，面向 RK357
   ├─ RGA：DMA fd → 640×640 RGB888（零拷贝，写入 RKNN 输入 DMA buffer）
   ├─ rknn_run()：INT8 推理，RKNN 内部自动完成量化
   ├─ YOLOv8 后处理：双遍缓存友好扫描 + NMS
-  └─ （可选）MJPEG 编码 → MjpegServer
+  ├─ push_latest(WebTask) → web_queue_（非阻塞）
+  └─ [web_thread] NV12→RGB→画框→JPEG → MjpegServer（独立线程）
     │
     │  BoundedQueue<InferResult>
     ▼
@@ -117,7 +118,7 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
 === RTSP YOLOv8 NPU Pipeline ===
   URL      : rtsp://192.168.1.100:8554/stream
   Model    : yolov8n.rknn
-  Workers  : 3 thread(s), RKNN_NPU_CORE_AUTO (SoC-adaptive)
+  Workers  : 2 thread(s), core 0 + core 1
 
   [frame   120]  car(0.89)[660,213,901,362]  truck(0.45)[844,106,959,285]
   [frame   121]  car(0.82)[655,210,895,358]
@@ -134,7 +135,7 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
   Avg post-proc   : 4.42 ms
   Total detections: 1172
   CPU usage       : 36.1%
-  NPU workers     : 3 (RKNN_NPU_CORE_AUTO)
+  NPU workers     : 2 (core 0 + core 1)
 =======================
 ```
 

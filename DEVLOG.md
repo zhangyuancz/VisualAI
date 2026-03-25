@@ -44,7 +44,7 @@ RKMPP 解码 → DMA fd (AVDRMFrameDescriptor)
 
 ---
 
-## [当前工作分支] RTSP 断流鲁棒性
+## [b652ad3] RTSP 断流鲁棒性
 
 ### 问题背景
 
@@ -165,3 +165,106 @@ int read_timeout_s     = 10;    // 读超时看门狗，0=关闭
 [Decoder] Stream ready: 1920x1080  25.00 fps  codec=h264_rkmpp  hw=RKMPP
 [Decoder] Reconnected successfully (was attempt 2)
 ```
+
+---
+
+## [6aba77f / 24da3b2] NPU 调度重构 + MJPEG 编码线程分离
+
+### 背景与问题
+
+原始代码通过 `--workers N` 控制 NPU worker 数量，核心绑定逻辑用 `num_workers==1` 判断：
+- 1 worker → `RKNN_NPU_CORE_ALL`（驱动分配所有核心参与单次推理）
+- 多 worker → 按 `id % 3` pin 到独立核心
+
+通过实测数据发现两个问题：
+
+**问题一：MJPEG 编码阻塞推理线程**
+
+开启 `--web-port` 后，Worker 0 的推理线程同步执行：
+`mmap拷贝 → NV12→RGB→画框→JPEG编码 → HTTP推送`
+
+修复前实测（`--web-port` 开启）：
+- 1 worker + web：12.5 FPS，CPU 75.4%，丢帧 284
+- 2 workers + web：29 FPS，CPU 63.7%，丢帧 8（Worker 1 补偿了 Worker 0 的损失）
+
+**问题二：`--workers` 语义与 RKNN API 混淆**
+
+`RKNN_NPU_CORE_AUTO = 0` 实为**随机单核**，并非智能调度；`RKNN_NPU_CORE_ALL = 0xffff` 才是驱动按平台自动分配所有核心。`num_workers` 字段间接控制核心选择，逻辑不直观。
+
+### RKNN 核心 API 澄清
+
+查阅 `04_Rockchip_RKNPU_API_Reference_RKNNRT_V2.3.2_CN.pdf`：
+
+| 枚举值 | 实际含义 |
+|--------|---------|
+| `RKNN_NPU_CORE_AUTO = 0` | 随机单核，无任何优化 |
+| `RKNN_NPU_CORE_ALL = 0xffff` | 驱动按平台分配所有核心参与单次推理 |
+| `RKNN_NPU_CORE_0/1/2` | 固定绑定到指定核心 |
+
+`rknn_run()` 是同步阻塞调用：
+- 1线程 + `CORE_ALL`：全核加速单次推理，同一时刻只有一帧在处理
+- N线程各 pin 一核：N帧并行推理，吞吐为 N 倍
+
+**多 worker 仅在 `stream_FPS > 1 / infer_time_per_worker` 时有实质收益。**
+
+### 解决方案
+
+**1. `--workers` → `--npu`，语义明确化**
+
+| `--npu` | 线程数 | 核心绑定 |
+|---------|--------|---------|
+| `-1`（默认） | `npu_core_count()` 个 | 线程 i 固定绑定 core i |
+| `0` | 1 | `RKNN_NPU_CORE_0` |
+| `1` | 1 | `RKNN_NPU_CORE_1` |
+| `2` | 1 | `RKNN_NPU_CORE_2`（仅 RK3588）|
+
+`npu_core_count()` 读取 `/proc/device-tree/compatible`：`rk3588`→3，`rk3576`→2，其他→1。不再使用 `CORE_ALL` / `CORE_AUTO`，每个 worker 始终 pin 到固定核心。
+
+**2. MJPEG 编码线程分离**
+
+新增 `web_thread_` + `web_queue_`（容量 2，`push_latest` 丢旧保新）：
+
+```
+修改前（同一线程串行）：
+  run():  RGA → mmap → rknn_run → 后处理 → NV12→RGB→画框→JPEG  ← 全阻塞
+
+修改后（两线程并行）：
+  run():     RGA → mmap → rknn_run → 后处理 → push_latest(WebTask)  ← 立即返回
+  web_run():                                      pop → NV12→RGB→画框→JPEG
+```
+
+推理线程剩余唯一 web 开销：mmap + memcpy（≈780KB，~40µs），可忽略。
+
+### 线程资源分布（最终架构）
+
+```
+线程              主要资源                  备注
+─────────────────────────────────────────────────────
+Decoder          RKMPP（硬件解码）          CPU 极低
+NpuWorker×N      RGA（HW）+ NPU + 后处理   CPU ~2ms/帧
+web_thread        sws + JPEG 编码           独立 CPU 核
+Main             result_queue 消费          CPU 极低
+```
+
+RK3576/RK3588 的 4+4 大小核完全覆盖上述线程，互不干扰。
+
+### 修复后实测基准（1080p H.264 RTSP，YOLOv8n）
+
+| 配置 | FPS | NPU 推理 | CPU 占用 | 丢帧 |
+|------|-----|---------|---------|------|
+| `--npu 0`（1 worker，含 web） | 29.78 | 18.16 ms | 121.7% | 9/3403 |
+| `--npu -1`（2 workers，含 web） | 27.81 | 21.64 ms | 79.1% | 0/1871 |
+
+> CPU 121.7% 为 Linux 多核累计（约 1.2 核满载）。
+
+修复前后对比（`--web-port` 开启，`--npu 0`）：
+
+| 状态 | FPS | CPU 占用 | 丢帧 |
+|------|-----|---------|------|
+| 修复前（MJPEG 同步编码） | 12.5 | 75.4% | 284/318 |
+| 修复后（MJPEG 独立线程） | 29.78 | 121.7% | 9/3403 |
+
+web_thread 解耦使 1 worker 吞吐从 12.5 FPS 恢复至接近流媒体上限（≈30 FPS）。
+2 workers 因 NPU 内存带宽竞争，单次推理从 18ms 升至 22ms，FPS 基本持平。
+在流帧率约 30 FPS 的场景下，1 worker 已是最优配置。
+

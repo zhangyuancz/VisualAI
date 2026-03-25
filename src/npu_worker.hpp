@@ -63,6 +63,7 @@ public:
 
 private:
     void run();
+    void web_run();  /* dedicated MJPEG encoder thread */
 
     /* RGA: letterbox scale NV12 frame → RGB888 640×640 (zero-copy) */
     bool rga_scale(AVFrame *frame, int &pad_x, int &pad_y, float &scale);
@@ -95,12 +96,19 @@ private:
     int   orig_w_  = 0;
     int   orig_h_  = 0;
 
-    /* Web debug visualization */
-    MjpegServer    *mjpeg_server_  = nullptr;
+    /* Web debug: dedicated encoder thread to avoid blocking inference */
+    struct WebTask {
+        std::vector<uint8_t>   nv12;
+        int                    w = 0, h = 0, y_stride = 0;
+        std::vector<Detection> dets;
+        int64_t                pts = 0;
+    };
+    MjpegServer              *mjpeg_server_  = nullptr;
+    BoundedQueue<WebTask>     web_queue_{2};     /* push_latest: drop old frames */
+    std::thread               web_thread_;
     SwsContext     *sws_nv12_rgb_  = nullptr;   /* NV12 → RGB24 */
     SwsContext     *sws_rgb_yuv_   = nullptr;   /* RGB24 → YUVJ420P */
     AVCodecContext *jpeg_ctx_      = nullptr;
-    std::vector<uint8_t> web_nv12_buf_;         /* raw NV12 capture */
     std::vector<uint8_t> web_rgb_buf_;          /* RGB24 intermediate */
     int64_t         web_pts_       = 0;
     int             web_cap_w_     = 0;
