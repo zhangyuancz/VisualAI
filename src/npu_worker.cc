@@ -24,6 +24,26 @@ extern "C" {
 #include "mjpeg_server.hpp"
 #include <sys/mman.h>
 
+/* ── SoC detection ───────────────────────────────────────────────────────────── */
+int npu_core_count()
+{
+    FILE *f = fopen("/proc/device-tree/compatible", "rb");
+    if (!f) return 1;
+    char buf[256] = {};
+    fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    /* compatible is a list of null-separated strings; scan each one */
+    for (int i = 0; i < (int)sizeof(buf); ) {
+        const char *s = buf + i;
+        if (strstr(s, "rk3588")) return 3;
+        if (strstr(s, "rk3576")) return 2;
+        int len = (int)strlen(s);
+        if (len == 0) break;
+        i += len + 1;
+    }
+    return 1;
+}
+
 /* ── Construction / destruction ─────────────────────────────────────────────── */
 NpuWorker::NpuWorker(int id,
                      BoundedQueue<AVFrame *>    &in_queue,
@@ -72,16 +92,9 @@ bool NpuWorker::init(const NpuWorkerConfig &cfg)
         return false;
     }
 
-    /* Pin to NPU core */
-    rknn_core_mask core_mask;
-    if (cfg.num_workers == 1) {
-        core_mask = RKNN_NPU_CORE_ALL;  /* driver distributes across all cores */
-    } else {
-        int core_idx = id_ % 3;
-        core_mask = kCoreMap[core_idx];
-    }
-    rknn_set_core_mask(ctx_, core_mask);
-    fprintf(stderr, "[NpuWorker %d] core_mask=0x%x\n", id_, (unsigned)core_mask);
+    /* Bind to NPU core */
+    rknn_set_core_mask(ctx_, cfg.core_mask);
+    fprintf(stderr, "[NpuWorker %d] core_mask=0x%x\n", id_, (unsigned)cfg.core_mask);
 
     /* Query I/O counts */
     rknn_input_output_num io_num{};

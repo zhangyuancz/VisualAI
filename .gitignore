@@ -21,6 +21,7 @@ compile_commands.json
 
 # clangd cache
 .cache/
+.clangd
 
 # Compiled binaries
 *.o

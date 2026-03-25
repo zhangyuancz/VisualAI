@@ -9,7 +9,7 @@
  *
  * Options:
  *   --transport tcp|udp     RTSP transport (default: tcp)
- *   --workers N             NPU worker threads (default: 1, max: 3)
+ *   --npu -1|0|1|2          NPU core spec (default: -1 = auto)
  *   --interval S            Stats print interval in seconds (default: 3)
  *   --verbose               Also print per-interval RGA/NPU/postproc timing
  */
@@ -35,12 +35,16 @@ static void print_usage(const char *prog) {
     printf("Usage: %s <rtsp_url> <model.rknn> [options]\n", prog);
     printf("Options:\n");
     printf("  --transport tcp|udp   RTSP transport (default: tcp)\n");
-    printf("  --workers N           NPU worker threads 1-3 (default: 1)\n");
+    printf("  --npu -1|0|1|2        NPU core spec (default: -1)\n");
+    printf("                          -1 = auto: one thread per core (SoC-adaptive)\n");
+    printf("                           0 = pin to NPU core 0 (1 thread)\n");
+    printf("                           1 = pin to NPU core 1 (1 thread)\n");
+    printf("                           2 = pin to NPU core 2 (1 thread, RK3588 only)\n");
     printf("  --interval S          Stats interval in seconds (default: 3)\n");
     printf("  --verbose             Print per-interval RGA/NPU/postproc timing\n");
     printf("  --web-port N          Enable MJPEG debug viewer on http://<ip>:N\n");
     printf("\nExample:\n");
-    printf("  %s rtsp://192.168.1.100:8554/stream model.rknn --workers 2\n\n", prog);
+    printf("  %s rtsp://192.168.1.100:8554/stream model.rknn --npu -1\n\n", prog);
 }
 
 static void print_video_info(const VideoInfo &info) {
@@ -74,21 +78,42 @@ int main(int argc, char *argv[])
     std::string model_path = argv[2];
 
     std::string transport   = "tcp";
-    int         num_workers = 1;
+    int         core_spec   = -1;   /* -1 = auto (all cores), 0/1/2 = pin */
     double      interval_s  = 3.0;
     bool        verbose     = false;
     int         web_port    = 0;
 
     for (int i = 3; i < argc; ++i) {
         if (!strcmp(argv[i], "--transport") && i + 1 < argc) transport = argv[++i];
-        else if (!strcmp(argv[i], "--workers")  && i + 1 < argc) num_workers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--npu")       && i + 1 < argc) core_spec   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--interval") && i + 1 < argc) interval_s  = atof(argv[++i]);
         else if (!strcmp(argv[i], "--web-port") && i + 1 < argc) web_port    = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--verbose"))  verbose = true;
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); print_usage(argv[0]); return 1; }
     }
 
-    num_workers = std::max(1, std::min(3, num_workers));
+    /* Build worker descriptors: {core_mask} for each thread to create */
+    struct WorkerDesc { rknn_core_mask mask; };
+    std::vector<WorkerDesc> worker_descs;
+
+    if (core_spec < 0) {
+        /* Auto: one RKNN_NPU_CORE_AUTO thread per physical NPU core */
+        int n = npu_core_count();
+        for (int i = 0; i < n; ++i)
+            worker_descs.push_back({RKNN_NPU_CORE_AUTO});
+    } else {
+        /* Pin to the specified core */
+        static constexpr rknn_core_mask kCoreMap[] = {
+            RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2,
+        };
+        if (core_spec > 2) {
+            fprintf(stderr, "Invalid --npu value %d (valid: -1, 0, 1, 2)\n", core_spec);
+            return 1;
+        }
+        worker_descs.push_back({kCoreMap[core_spec]});
+    }
+
+    int num_workers = (int)worker_descs.size();
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
@@ -96,7 +121,10 @@ int main(int argc, char *argv[])
     printf("=== RTSP YOLOv8 NPU Pipeline ===\n");
     printf("  URL      : %s\n", rtsp_url.c_str());
     printf("  Model    : %s\n", model_path.c_str());
-    printf("  Workers  : %d NPU thread(s)\n", num_workers);
+    if (core_spec < 0)
+        printf("  Workers  : %d thread(s), RKNN_NPU_CORE_AUTO (SoC-adaptive)\n", num_workers);
+    else
+        printf("  Workers  : 1 thread, pinned to NPU core %d\n", core_spec);
     printf("  Transport: %s\n", transport.c_str());
     if (web_port > 0)
         printf("  Web view : http://<device-ip>:%d\n", web_port);
@@ -130,11 +158,10 @@ int main(int argc, char *argv[])
     for (int i = 0; i < num_workers; ++i) {
         auto w = std::make_unique<NpuWorker>(i, frame_queue, result_queue);
         NpuWorkerConfig wcfg;
-        wcfg.worker_id   = i;
-        wcfg.num_workers = num_workers;
-        wcfg.model_path  = model_path;
-        wcfg.model_w     = 640;
-        wcfg.model_h     = 640;
+        wcfg.core_mask  = worker_descs[i].mask;
+        wcfg.model_path = model_path;
+        wcfg.model_w    = 640;
+        wcfg.model_h    = 640;
         if (!w->init(wcfg)) {
             fprintf(stderr, "Failed to initialise NPU worker %d\n", i);
             return 1;

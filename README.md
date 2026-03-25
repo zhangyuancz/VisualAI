@@ -9,7 +9,7 @@ RTSP → RKMPP 硬件解码 → RGA 缩放 → RKNN YOLOv8 推理，面向 RK357
 - **RTSP 拉流**：支持 TCP / UDP，FFmpeg + h264_rkmpp / hevc_rkmpp 硬件解码
 - **零拷贝**：RKMPP DMA buf 直接送入 RGA，RGA 输出直接写入 RKNN 输入 buffer，CPU 不参与像素搬运
 - **实时性**：推理速度低于流帧率时，自动丢弃最旧帧，始终处理最新画面
-- **多 NPU 核心**：可配置 1~3 个 worker 线程，兼容 RK3576（2 核）和 RK3588（3 核）
+- **多 NPU 核心**：`--npu -1` 自动按 SoC 核心数（RK3576=2，RK3588=3）创建对应线程，全部使用 `RKNN_NPU_CORE_AUTO` 由驱动动态调度
 - **断流自动重连**：EOF / 网络错误 / 读超时均触发重连，指数退避，无需外部守护进程
 - **MJPEG 调试查看器**：可选开启，浏览器实时查看带检测框的标注画面
 
@@ -92,8 +92,11 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
 # 开启 MJPEG 调试查看器，浏览器访问 http://<device-ip>:8080
 ./rtsp_yolo <url> <model.rknn> --web-port 8080
 
-# 指定 2 个 NPU worker（RK3576 双核 / RK3588 可用 3）
-./rtsp_yolo <url> <model.rknn> --workers 2
+# 自动按 SoC 核心数分配 NPU 线程（默认行为，-1 = auto）
+./rtsp_yolo <url> <model.rknn> --npu -1
+
+# 固定使用 NPU core 0（单线程调试）
+./rtsp_yolo <url> <model.rknn> --npu 0
 ```
 
 ### 参数说明
@@ -101,7 +104,7 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--transport tcp\|udp` | `tcp` | RTSP 传输协议 |
-| `--workers N` | `1` | NPU worker 线程数（1~3） |
+| `--npu -1\|0\|1\|2` | `-1` | NPU 核心选择：-1=自动适配 SoC，0/1/2=固定单核 |
 | `--interval S` | `3` | 统计打印间隔（秒） |
 | `--verbose` | 关闭 | 打印每周期 RGA / NPU / 后处理耗时 |
 | `--web-port N` | 关闭 | 启用 MJPEG 调试查看器 |
@@ -114,7 +117,7 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
 === RTSP YOLOv8 NPU Pipeline ===
   URL      : rtsp://192.168.1.100:8554/stream
   Model    : yolov8n.rknn
-  Workers  : 1 NPU thread(s)
+  Workers  : 3 thread(s), RKNN_NPU_CORE_AUTO (SoC-adaptive)
 
   [frame   120]  car(0.89)[660,213,901,362]  truck(0.45)[844,106,959,285]
   [frame   121]  car(0.82)[655,210,895,358]
@@ -131,7 +134,7 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
   Avg post-proc   : 4.42 ms
   Total detections: 1172
   CPU usage       : 36.1%
-  NPU workers     : 1
+  NPU workers     : 3 (RKNN_NPU_CORE_AUTO)
 =======================
 ```
 
@@ -143,7 +146,7 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
 |------|------|
 | 解码方式 | RKMPP 硬件解码 |
 | RGA 缩放耗时 | ~1.9 ms |
-| NPU 推理耗时 | ~16.7 ms（1 worker，双核并行） |
+| NPU 推理耗时 | ~16.7 ms（--npu -1，双核 AUTO 调度）|
 | 后处理耗时 | ~4.4 ms |
 | 推理帧率 | ~19 fps |
 | CPU 占用 | ~36% |

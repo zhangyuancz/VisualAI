@@ -8,3 +8,5 @@ CompileFlags:
     - -isystem/usr/aarch64-linux-gnu/include/c++/13/backward
     - -isystem/usr/lib/gcc-cross/aarch64-linux-gnu/13/include
     - -isystem/usr/aarch64-linux-gnu/include
+Diagnostics:
+  UnusedIncludes: None

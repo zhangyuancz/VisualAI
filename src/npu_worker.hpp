@@ -5,7 +5,9 @@
  *   RKMPP DMA fd (NV12) → RGA (scale + YUV→RGB) → RKNN input DMA buffer
  *   → RKNN inference → INT8 outputs read directly from pre-allocated mems
  *
- * Multiple workers can run concurrently, each pinned to a different NPU core.
+ * Core assignment (via NpuWorkerConfig::core_mask):
+ *   RKNN_NPU_CORE_AUTO  — auto-schedule to any idle core (default)
+ *   RKNN_NPU_CORE_0/1/2 — pin to a specific core
  *
  * Optional web debug: call set_mjpeg_server() before start().
  * Worker will capture, annotate and JPEG-encode each frame for the browser.
@@ -32,19 +34,15 @@ class  MjpegServer;
 struct SwsContext;
 struct AVCodecContext;
 
-/* NPU core assignments indexed by worker_id */
-static constexpr rknn_core_mask kCoreMap[] = {
-    RKNN_NPU_CORE_0,
-    RKNN_NPU_CORE_1,
-    RKNN_NPU_CORE_2,
-};
+/* Detect the number of NPU cores from /proc/device-tree/compatible.
+ * Returns 3 for RK3588, 2 for RK3576, 1 for all other platforms. */
+int npu_core_count();
 
 struct NpuWorkerConfig {
-    int         worker_id      = 0;
-    int         num_workers    = 1;   /* total workers → chooses core mask */
-    std::string model_path;
-    int         model_w        = 640;
-    int         model_h        = 640;
+    rknn_core_mask core_mask  = RKNN_NPU_CORE_AUTO; /* AUTO or pinned core */
+    std::string    model_path;
+    int            model_w    = 640;
+    int            model_h    = 640;
 };
 
 class NpuWorker {
