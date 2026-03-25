@@ -92,20 +92,21 @@ int main(int argc, char *argv[])
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); print_usage(argv[0]); return 1; }
     }
 
+    static constexpr rknn_core_mask kCoreMap[] = {
+        RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2,
+    };
+
     /* Build worker descriptors: {core_mask} for each thread to create */
     struct WorkerDesc { rknn_core_mask mask; };
     std::vector<WorkerDesc> worker_descs;
 
     if (core_spec < 0) {
-        /* Auto: one RKNN_NPU_CORE_AUTO thread per physical NPU core */
+        /* Auto: N threads, thread i pinned to NPU core i */
         int n = npu_core_count();
         for (int i = 0; i < n; ++i)
-            worker_descs.push_back({RKNN_NPU_CORE_AUTO});
+            worker_descs.push_back({kCoreMap[i]});
     } else {
-        /* Pin to the specified core */
-        static constexpr rknn_core_mask kCoreMap[] = {
-            RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2,
-        };
+        /* Single thread pinned to the specified core */
         if (core_spec > 2) {
             fprintf(stderr, "Invalid --npu value %d (valid: -1, 0, 1, 2)\n", core_spec);
             return 1;
@@ -122,9 +123,9 @@ int main(int argc, char *argv[])
     printf("  URL      : %s\n", rtsp_url.c_str());
     printf("  Model    : %s\n", model_path.c_str());
     if (core_spec < 0)
-        printf("  Workers  : %d thread(s), RKNN_NPU_CORE_AUTO (SoC-adaptive)\n", num_workers);
+        printf("  NPU      : %d thread(s), each pinned to core 0..%d\n", num_workers, num_workers - 1);
     else
-        printf("  Workers  : 1 thread, pinned to NPU core %d\n", core_spec);
+        printf("  NPU      : 1 thread, pinned to core %d\n", core_spec);
     printf("  Transport: %s\n", transport.c_str());
     if (web_port > 0)
         printf("  Web view : http://<device-ip>:%d\n", web_port);

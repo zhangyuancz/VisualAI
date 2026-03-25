@@ -6,8 +6,9 @@
  *   → RKNN inference → INT8 outputs read directly from pre-allocated mems
  *
  * Core assignment (via NpuWorkerConfig::core_mask):
- *   RKNN_NPU_CORE_AUTO  — auto-schedule to any idle core (default)
- *   RKNN_NPU_CORE_0/1/2 — pin to a specific core
+ *   --npu -1: N threads each pinned to RKNN_NPU_CORE_0/1/2, N = npu_core_count()
+ *             RK3576=2 threads, RK3588=3 threads
+ *   --npu 0/1/2: single thread pinned to the specified core
  *
  * Optional web debug: call set_mjpeg_server() before start().
  * Worker will capture, annotate and JPEG-encode each frame for the browser.
@@ -39,7 +40,7 @@ struct AVCodecContext;
 int npu_core_count();
 
 struct NpuWorkerConfig {
-    rknn_core_mask core_mask  = RKNN_NPU_CORE_AUTO; /* AUTO or pinned core */
+    rknn_core_mask core_mask  = RKNN_NPU_CORE_0; /* set by main per worker index */
     std::string    model_path;
     int            model_w    = 640;
     int            model_h    = 640;
