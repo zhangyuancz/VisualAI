@@ -12,6 +12,7 @@ RTSP → RKMPP 硬件解码 → RGA 缩放 → RKNN YOLOv8 推理，面向 RK357
 - **多 NPU 核心**：`--npu -1` 自动按 SoC 核心数（RK3576=2，RK3588=3）创建对应线程，每线程 pin 到固定 NPU 核心（`RKNN_NPU_CORE_0/1/2`）
 - **断流自动重连**：EOF / 网络错误 / 读超时均触发重连，指数退避，无需外部守护进程
 - **MJPEG 调试查看器**：可选开启，浏览器实时查看带检测框的标注画面
+- **停车位占用检测**：从 `spot.conf` 加载任意四边形停车位，逐帧判断是否有车辆压入，叠加颜色标注（绿=空闲，红=占用）
 
 ---
 
@@ -93,6 +94,9 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
 # 开启 MJPEG 调试查看器，浏览器访问 http://<device-ip>:8080
 ./rtsp_yolo <url> <model.rknn> --web-port 8080
 
+# 启用停车位占用检测
+./rtsp_yolo <url> <model.rknn> --spots-config tools/spot.conf --web-port 8080
+
 # 自动按 SoC 核心数分配 NPU 线程（默认行为，-1 = auto）
 ./rtsp_yolo <url> <model.rknn> --npu -1
 
@@ -109,6 +113,7 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
 | `--interval S` | `3` | 统计打印间隔（秒） |
 | `--verbose` | 关闭 | 打印每周期 RGA / NPU / 后处理耗时 |
 | `--web-port N` | 关闭 | 启用 MJPEG 调试查看器 |
+| `--spots-config FILE` | 关闭 | 停车位配置文件路径（`spot.conf`） |
 
 ---
 
@@ -159,12 +164,17 @@ scp /home/miles/workspace/rockchip/sysroot_3576/usr/lib/librknnrt.so user@device
 ```
 src/
 ├── main.cc            # 入口，参数解析，shutdown 逻辑
-├── common.hpp         # BoundedQueue<T>，InferResult，Detection
+├── common.hpp         # BoundedQueue<T>，InferResult，Detection，OccupancyResult
 ├── decoder.cc/hpp     # RTSP 拉流 + RKMPP 硬件解码线程（含断流重连）
 ├── npu_worker.cc/hpp  # RGA 零拷贝缩放 + RKNN 推理 + MJPEG 编码
 ├── postprocess.cc/hpp # YOLOv8 后处理，双遍缓存友好扫描
+├── parking.cc/hpp     # 停车位加载（spot.conf）+ Sutherland-Hodgman 交集检测
 ├── stats.cc/hpp       # 帧率 / 延迟 / CPU 统计
 └── mjpeg_server.cc/hpp # HTTP MJPEG 调试服务
+
+tools/
+├── annotate_spots.py  # 交互式停车位角点标注工具（输出 spot.conf）
+└── spot.conf          # 停车位定义示例（1920×1080）
 
 cmake/
 └── toolchain.cmake    # aarch64 交叉编译工具链定义

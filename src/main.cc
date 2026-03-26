@@ -19,6 +19,7 @@
 #include "npu_worker.hpp"
 #include "stats.hpp"
 #include "mjpeg_server.hpp"
+#include "parking.hpp"
 
 #include <csignal>
 #include <cstdio>
@@ -43,6 +44,7 @@ static void print_usage(const char *prog) {
     printf("  --interval S          Stats interval in seconds (default: 3)\n");
     printf("  --verbose             Print per-interval RGA/NPU/postproc timing\n");
     printf("  --web-port N          Enable MJPEG debug viewer on http://<ip>:N\n");
+    printf("  --spots-config FILE   Parking spot config (from annotate_spots.py)\n");
     printf("\nExample:\n");
     printf("  %s rtsp://192.168.1.100:8554/stream model.rknn --npu -1\n\n", prog);
 }
@@ -82,12 +84,14 @@ int main(int argc, char *argv[])
     double      interval_s  = 3.0;
     bool        verbose     = false;
     int         web_port    = 0;
+    std::string parking_config_path;
 
     for (int i = 3; i < argc; ++i) {
         if (!strcmp(argv[i], "--transport") && i + 1 < argc) transport = argv[++i];
         else if (!strcmp(argv[i], "--npu")       && i + 1 < argc) core_spec   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--interval") && i + 1 < argc) interval_s  = atof(argv[++i]);
         else if (!strcmp(argv[i], "--web-port") && i + 1 < argc) web_port    = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--spots-config") && i + 1 < argc) parking_config_path = argv[++i];
         else if (!strcmp(argv[i], "--verbose"))  verbose = true;
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); print_usage(argv[0]); return 1; }
     }
@@ -129,6 +133,8 @@ int main(int argc, char *argv[])
     printf("  Transport: %s\n", transport.c_str());
     if (web_port > 0)
         printf("  Web view : http://<device-ip>:%d\n", web_port);
+    if (!parking_config_path.empty())
+        printf("  Parking  : %s\n", parking_config_path.c_str());
     printf("\n");
 
     /* ── MJPEG web server (optional) ── */
@@ -154,6 +160,19 @@ int main(int argc, char *argv[])
     }
     print_video_info(vinfo);
 
+    /* ── Parking spot config (optional) ── */
+    std::vector<ParkingSpot> parking_spots;
+    if (!parking_config_path.empty()) {
+        parking_spots = load_parking_config(parking_config_path);
+        if (parking_spots.empty()) {
+            fprintf(stderr, "Error: failed to load parking config from %s\n",
+                    parking_config_path.c_str());
+            return 1;
+        }
+        printf("Parking spots: %zu loaded from %s\n",
+               parking_spots.size(), parking_config_path.c_str());
+    }
+
     std::vector<std::unique_ptr<NpuWorker>> workers;
     workers.reserve(num_workers);
     for (int i = 0; i < num_workers; ++i) {
@@ -170,6 +189,8 @@ int main(int argc, char *argv[])
         /* Only worker 0 handles web encoding to avoid redundant work */
         if (web_server && i == 0)
             w->set_mjpeg_server(web_server.get());
+        if (!parking_spots.empty())
+            w->set_parking_spots(parking_spots);
         workers.push_back(std::move(w));
     }
 
@@ -200,6 +221,16 @@ int main(int argc, char *argv[])
                 printf("  %s(%.2f)[%.0f,%.0f,%.0f,%.0f]",
                        d.label, d.conf,
                        d.box.left, d.box.top, d.box.right, d.box.bottom);
+            }
+            printf("\n");
+        }
+
+        /* Parking occupancy summary */
+        if (!result.occupancy.empty()) {
+            printf("  [frame %6lld]  parking:", (long long)result.frame_id);
+            for (const auto &occ : result.occupancy) {
+                printf("  %s=%s", occ.label,
+                       occ.occupied ? "OCCUPIED" : "empty");
             }
             printf("\n");
         }

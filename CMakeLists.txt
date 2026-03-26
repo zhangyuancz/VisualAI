@@ -38,6 +38,7 @@ add_executable(rtsp_yolo
     src/postprocess.cc
     src/stats.cc
     src/mjpeg_server.cc
+    src/parking.cc
 )
 
 target_include_directories(rtsp_yolo PRIVATE src)

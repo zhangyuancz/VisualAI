@@ -29,14 +29,35 @@ struct Detection {
     BBox  box;
 };
 
+/* ── Parking occupancy result ──────────────────────────────────────────────── */
+
+/**
+ * OccupancyResult — per-spot occupancy for the MJPEG overlay and logging.
+ * Corners are stored in MODEL resolution so the overlay draw code doesn't
+ * need to recompute the letterbox transform.
+ */
+struct OccupancyResult {
+    int    spot_id;
+    char   label[32];
+    bool   occupied;
+    float  overlap_pct;       /* intersection / quad_area */
+    float  mapped_corners[4][2]; /* corners in MODEL resolution */
+};
+
 struct InferResult {
-    int64_t              frame_id   = 0;
-    int64_t              decode_us  = 0;
-    int64_t              scale_us   = 0;
-    int64_t              infer_us   = 0;
+    int64_t              frame_id    = 0;
+    int64_t              decode_us   = 0;
+    int64_t              scale_us    = 0;
+    int64_t              infer_us    = 0;
     int64_t              postproc_us = 0;
     int                  npu_worker_id;
-    std::vector<Detection> dets;
+    std::vector<Detection>      dets;
+    /* Letterbox params for coordinate transforms */
+    int                  orig_w  = 0, orig_h  = 0;
+    int                  pad_x   = 0, pad_y   = 0;
+    float                scale   = 1.0f;
+    /* Parking occupancy (filled when parking config is loaded) */
+    std::vector<OccupancyResult> occupancy;
 };
 
 /* ── Thread-safe bounded queue ─────────────────────────────────────────────── */

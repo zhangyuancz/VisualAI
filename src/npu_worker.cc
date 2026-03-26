@@ -22,6 +22,7 @@ extern "C" {
 }
 
 #include "mjpeg_server.hpp"
+#include "parking.hpp"
 #include <sys/mman.h>
 
 /* ── SoC detection ───────────────────────────────────────────────────────────── */
@@ -340,7 +341,9 @@ bool NpuWorker::init_web_encoder(int w, int h)
 
 void NpuWorker::encode_and_push_web(const uint8_t *nv12, int w, int h,
                                     int y_stride,
-                                    const std::vector<Detection> &dets)
+                                    const std::vector<Detection> &dets,
+                                    const std::vector<OccupancyResult> &occupancy,
+                                    int pad_x, int pad_y, float scale)
 {
     /* Lazy init on first frame */
     if (!jpeg_ctx_) {
@@ -373,6 +376,26 @@ void NpuWorker::encode_and_push_web(const uint8_t *nv12, int w, int h,
                       r, g, b, 3);
     }
 
+    /* ── Draw parking spot quads ── */
+    for (const auto &occ : occupancy) {
+        // Map model-space corners back to original resolution for overlay
+        float orig_corners[4][2];
+        for (int i = 0; i < 4; ++i) {
+            orig_corners[i][0] = occ.mapped_corners[i][0] * scale + pad_x;
+            orig_corners[i][1] = occ.mapped_corners[i][1] * scale + pad_y;
+        }
+        uint8_t pr = occ.occupied ? 255 : 0;
+        uint8_t pg = occ.occupied ? 0   : 255;
+        uint8_t pb = 0;
+        draw_quad_rgb(web_rgb_buf_.data(), w, h, orig_corners, pr, pg, pb, 3);
+        // Draw a filled dot at the first corner to indicate spot ID
+        int cx = std::max(3, std::min(w - 4, static_cast<int>(orig_corners[0][0])));
+        int cy = std::max(3, std::min(h - 4, static_cast<int>(orig_corners[0][1])));
+        draw_rect_rgb(web_rgb_buf_.data(), w, h,
+                      cx - 4, cy - 4, cx + 4, cy + 4,
+                      pr, pg, pb, -1);  // -1 = filled
+    }
+
     /* ── RGB24 → YUVJ420P → JPEG ── */
     AVFrame *yuv = av_frame_alloc();
     yuv->format  = AV_PIX_FMT_YUVJ420P;
@@ -403,7 +426,8 @@ void NpuWorker::web_run()
     WebTask task;
     while (web_queue_.pop(task)) {
         encode_and_push_web(task.nv12.data(), task.w, task.h,
-                            task.y_stride, task.dets);
+                            task.y_stride, task.dets, task.occupancy,
+                            task.pad_x, task.pad_y, task.scale);
     }
 }
 
@@ -482,9 +506,28 @@ void NpuWorker::run()
 
         result.postproc_us = now_us() - t0;
 
+        /* ── Parking spot occupancy check ── */
+        result.orig_w  = orig_w;
+        result.orig_h  = orig_h;
+        result.pad_x   = pad_x;
+        result.pad_y   = pad_y;
+        result.scale   = scale;
+
+        if (!parking_spots_.empty()) {
+            result.occupancy = check_spot_occupancy(
+                parking_spots_, result.dets,
+                pad_x, pad_y, scale,
+                orig_w, orig_h,
+                overlap_thresh_);
+        }
+
         /* ── Web debug: hand off to encoder thread (non-blocking) ── */
         if (mjpeg_server_ && web_ok) {
             web_task.dets = result.dets;
+            web_task.occupancy = result.occupancy;
+            web_task.pad_x = pad_x;
+            web_task.pad_y = pad_y;
+            web_task.scale = scale;
             web_queue_.push_latest(std::move(web_task), [](WebTask &) {});
         }
 

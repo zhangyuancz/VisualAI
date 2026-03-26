@@ -17,6 +17,7 @@
 
 #include "common.hpp"
 #include "postprocess.hpp"
+#include "parking.hpp"
 
 #include <atomic>
 #include <thread>
@@ -61,6 +62,12 @@ public:
     /* Set MJPEG server for web debug visualization (optional, call before start) */
     void set_mjpeg_server(MjpegServer *srv) { mjpeg_server_ = srv; }
 
+    /* Parking spot configuration (optional, call before start) */
+    void set_parking_spots(std::vector<ParkingSpot> spots) {
+        parking_spots_ = std::move(spots);
+    }
+    void set_overlap_thresh(float t) { overlap_thresh_ = t; }
+
 private:
     void run();
     void web_run();  /* dedicated MJPEG encoder thread */
@@ -71,12 +78,18 @@ private:
     /* Web debug: NV12 → RGB → draw boxes → JPEG → push to MjpegServer */
     bool init_web_encoder(int w, int h);
     void encode_and_push_web(const uint8_t *nv12, int w, int h, int y_stride,
-                             const std::vector<Detection> &dets);
+                             const std::vector<Detection> &dets,
+                             const std::vector<OccupancyResult> &occupancy,
+                             int pad_x, int pad_y, float scale);
 
     /* ── Members ── */
     int                       id_;
     BoundedQueue<AVFrame *>  &in_queue_;
     BoundedQueue<InferResult> &out_queue_;
+
+    /* Parking spot config */
+    std::vector<ParkingSpot>  parking_spots_;
+    float                      overlap_thresh_ = 0.25f;
 
     /* RKNN */
     rknn_context              ctx_      = 0;
@@ -98,10 +111,13 @@ private:
 
     /* Web debug: dedicated encoder thread to avoid blocking inference */
     struct WebTask {
-        std::vector<uint8_t>   nv12;
-        int                    w = 0, h = 0, y_stride = 0;
-        std::vector<Detection> dets;
-        int64_t                pts = 0;
+        std::vector<uint8_t>        nv12;
+        int                         w = 0, h = 0, y_stride = 0;
+        std::vector<Detection>     dets;
+        std::vector<OccupancyResult> occupancy;  /* parking spot results */
+        int                         pad_x = 0, pad_y = 0;
+        float                       scale = 1.0f;
+        int64_t                    pts = 0;
     };
     MjpegServer              *mjpeg_server_  = nullptr;
     BoundedQueue<WebTask>     web_queue_{2};     /* push_latest: drop old frames */
